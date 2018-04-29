@@ -37,14 +37,12 @@ import org.junit.Test;
 import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 import org.springframework.cloud.client.ServiceInstance;
-import org.springframework.cloud.client.loadbalancer.LoadBalancedBackOffPolicyFactory;
-import org.springframework.cloud.client.loadbalancer.LoadBalancedRetryListenerFactory;
+import org.springframework.cloud.client.loadbalancer.LoadBalancedRetryFactory;
 import org.springframework.cloud.client.loadbalancer.LoadBalancedRetryPolicy;
-import org.springframework.cloud.client.loadbalancer.LoadBalancedRetryPolicyFactory;
 import org.springframework.cloud.client.loadbalancer.ServiceInstanceChooser;
 import org.springframework.cloud.netflix.ribbon.DefaultServerIntrospector;
+import org.springframework.cloud.netflix.ribbon.RibbonLoadBalancedRetryFactory;
 import org.springframework.cloud.netflix.ribbon.RibbonLoadBalancedRetryPolicy;
-import org.springframework.cloud.netflix.ribbon.RibbonLoadBalancedRetryPolicyFactory;
 import org.springframework.cloud.netflix.ribbon.RibbonLoadBalancerContext;
 import org.springframework.cloud.netflix.ribbon.ServerIntrospector;
 import org.springframework.cloud.netflix.ribbon.SpringClientFactory;
@@ -78,6 +76,7 @@ import static org.junit.Assert.assertEquals;
 import static org.mockito.Matchers.any;
 import static org.mockito.Matchers.anyBoolean;
 import static org.mockito.Matchers.anyInt;
+import static org.mockito.Matchers.anyObject;
 import static org.mockito.Matchers.eq;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
@@ -96,8 +95,6 @@ public class RetryableFeignLoadBalancerTests {
 	@Mock
 	private IClientConfig config;
 	private ServerIntrospector inspector = new DefaultServerIntrospector();
-	private LoadBalancedBackOffPolicyFactory loadBalancedBackOffPolicyFactory =
-			new LoadBalancedBackOffPolicyFactory.NoBackOffPolicyFactory();
 
 	private Integer defaultConnectTimeout = 10000;
 	private Integer defaultReadTimeout = 10000;
@@ -128,7 +125,7 @@ public class RetryableFeignLoadBalancerTests {
 		doReturn(defaultReadTimeout).when(config).get(eq(CommonClientConfigKey.ReadTimeout));
 		doReturn("404,502,foo, ,").when(config).getPropertyAsString(eq(RibbonLoadBalancedRetryPolicy.RETRYABLE_STATUS_CODES),eq(""));
 		doReturn(config).when(clientFactory).getClientConfig(eq("default"));
-		RibbonLoadBalancedRetryPolicyFactory loadBalancedRetryPolicyFactory = new RibbonLoadBalancedRetryPolicyFactory(clientFactory);
+		RibbonLoadBalancedRetryFactory loadBalancedRetryFactory = new RibbonLoadBalancedRetryFactory(clientFactory);
 		HttpRequest springRequest = mock(HttpRequest.class);
 		Request feignRequest = Request.create("GET", "http://foo", new HashMap<String, Collection<String>>(),
 				new byte[]{}, StandardCharsets.UTF_8);
@@ -136,8 +133,7 @@ public class RetryableFeignLoadBalancerTests {
 		FeignLoadBalancer.RibbonRequest request = new FeignLoadBalancer.RibbonRequest(client, feignRequest, new URI("http://foo"));
 		Response response = Response.builder().status(200).headers(new HashMap<String, Collection<String>>()).build();
 		doReturn(response).when(client).execute(any(Request.class), any(Request.Options.class));
-		RetryableFeignLoadBalancer feignLb = new RetryableFeignLoadBalancer(lb, config, inspector, loadBalancedRetryPolicyFactory,
-				loadBalancedBackOffPolicyFactory);
+		RetryableFeignLoadBalancer feignLb = new RetryableFeignLoadBalancer(lb, config, inspector, loadBalancedRetryFactory);
 		FeignLoadBalancer.RibbonResponse ribbonResponse = feignLb.execute(request, null);
 		assertEquals(200, ribbonResponse.toResponse().status());
 		verify(client, times(1)).execute(any(Request.class), any(Request.Options.class));
@@ -151,12 +147,22 @@ public class RetryableFeignLoadBalancerTests {
 		Client client = mock(Client.class);
 		FeignLoadBalancer.RibbonRequest request = new FeignLoadBalancer.RibbonRequest(client, feignRequest, new URI("http://foo"));
 		doThrow(new IOException("boom")).when(client).execute(any(Request.class), any(Request.Options.class));
-		RetryableFeignLoadBalancer feignLb = new RetryableFeignLoadBalancer(lb, config, inspector, new LoadBalancedRetryPolicyFactory() {
+		RetryableFeignLoadBalancer feignLb = new RetryableFeignLoadBalancer(lb, config, inspector, new LoadBalancedRetryFactory() {
 			@Override
-			public LoadBalancedRetryPolicy create(String s, ServiceInstanceChooser serviceInstanceChooser) {
+			public LoadBalancedRetryPolicy createRetryPolicy(String s, ServiceInstanceChooser serviceInstanceChooser) {
 				return null;
 			}
-		}, loadBalancedBackOffPolicyFactory);
+
+			@Override
+			public RetryListener[] createRetryListeners(String service) {
+				return new RetryListener[0];
+			}
+
+			@Override
+			public BackOffPolicy createBackOffPolicy(String service) {
+				return null;
+			}
+		});
 		try {
 			feignLb.execute(request, null);
 		} catch(Exception e) {
@@ -179,7 +185,13 @@ public class RetryableFeignLoadBalancerTests {
 		doReturn("").when(config).getPropertyAsString(eq(RibbonLoadBalancedRetryPolicy.RETRYABLE_STATUS_CODES),eq(""));
 		doReturn(config).when(clientFactory).getClientConfig(eq("default"));
 		doReturn(lbContext).when(clientFactory).getLoadBalancerContext(any(String.class));
-		RibbonLoadBalancedRetryPolicyFactory loadBalancedRetryPolicyFactory = new RibbonLoadBalancedRetryPolicyFactory(clientFactory);
+		MyBackOffPolicy backOffPolicy = new MyBackOffPolicy();
+		RibbonLoadBalancedRetryFactory loadBalancedRetryFactory = new RibbonLoadBalancedRetryFactory(clientFactory){
+			@Override
+			public BackOffPolicy createBackOffPolicy(String service) {
+				return backOffPolicy;
+			}
+		};
 		HttpRequest springRequest = mock(HttpRequest.class);
 		Request feignRequest = Request.create("GET", "http://foo", new HashMap<String, Collection<String>>(),
 				new byte[]{}, StandardCharsets.UTF_8);
@@ -187,13 +199,12 @@ public class RetryableFeignLoadBalancerTests {
 		FeignLoadBalancer.RibbonRequest request = new FeignLoadBalancer.RibbonRequest(client, feignRequest, new URI("http://foo"));
 		Response response = Response.builder().status(200).headers(new HashMap<String, Collection<String>>()).build();
 		doThrow(new IOException("boom")).doReturn(response).when(client).execute(any(Request.class), any(Request.Options.class));
-		MyBackOffPolicyFactory backOffPolicyFactory = new MyBackOffPolicyFactory();
-		RetryableFeignLoadBalancer feignLb = new RetryableFeignLoadBalancer(lb, config, inspector, loadBalancedRetryPolicyFactory,
-				backOffPolicyFactory);
+
+		RetryableFeignLoadBalancer feignLb = new RetryableFeignLoadBalancer(lb, config, inspector, loadBalancedRetryFactory);
 		FeignLoadBalancer.RibbonResponse ribbonResponse = feignLb.execute(request, null);
 		assertEquals(200, ribbonResponse.toResponse().status());
 		verify(client, times(2)).execute(any(Request.class), any(Request.Options.class));
-		assertEquals(1, backOffPolicyFactory.getCount());
+		assertEquals(1, backOffPolicy.getCount());
 	}
 
 	@Test
@@ -209,7 +220,13 @@ public class RetryableFeignLoadBalancerTests {
 		doReturn("404").when(config).getPropertyAsString(eq(RibbonLoadBalancedRetryPolicy.RETRYABLE_STATUS_CODES),eq(""));
 		doReturn(config).when(clientFactory).getClientConfig(eq("default"));
 		doReturn(lbContext).when(clientFactory).getLoadBalancerContext(any(String.class));
-		RibbonLoadBalancedRetryPolicyFactory loadBalancedRetryPolicyFactory = new RibbonLoadBalancedRetryPolicyFactory(clientFactory);
+		MyBackOffPolicy backOffPolicy = new MyBackOffPolicy();
+		RibbonLoadBalancedRetryFactory loadBalancedRetryFactory = new RibbonLoadBalancedRetryFactory(clientFactory){
+			@Override
+			public BackOffPolicy createBackOffPolicy(String service) {
+				return backOffPolicy;
+			}
+		};
 		HttpRequest springRequest = mock(HttpRequest.class);
 		Request feignRequest = Request.create("GET", "http://foo", new HashMap<String, Collection<String>>(),
 				new byte[]{}, StandardCharsets.UTF_8);
@@ -218,13 +235,51 @@ public class RetryableFeignLoadBalancerTests {
 		Response response = Response.builder().status(200).headers(new HashMap<String, Collection<String>>()).build();
 		Response fourOFourResponse = Response.builder().status(404).headers(new HashMap<String, Collection<String>>()).build();
 		doReturn(fourOFourResponse).doReturn(response).when(client).execute(any(Request.class), any(Request.Options.class));
-		MyBackOffPolicyFactory backOffPolicyFactory = new MyBackOffPolicyFactory();
-		RetryableFeignLoadBalancer feignLb = new RetryableFeignLoadBalancer(lb, config, inspector, loadBalancedRetryPolicyFactory,
-				backOffPolicyFactory);
+		RetryableFeignLoadBalancer feignLb = new RetryableFeignLoadBalancer(lb, config, inspector, loadBalancedRetryFactory);
 		FeignLoadBalancer.RibbonResponse ribbonResponse = feignLb.execute(request, null);
 		assertEquals(200, ribbonResponse.toResponse().status());
 		verify(client, times(2)).execute(any(Request.class), any(Request.Options.class));
-		assertEquals(1, backOffPolicyFactory.getCount());
+		assertEquals(1, backOffPolicy.getCount());
+	}
+
+		@Test
+	public void executeRetryOnStatusCodeWithEmptyBody() throws Exception {
+			int retriesNextServer = 0;
+			when(this.config.get(MaxAutoRetriesNextServer,
+							DEFAULT_MAX_AUTO_RETRIES_NEXT_SERVER)).thenReturn(retriesNextServer);
+			doReturn(new Server("foo", 80)).when(lb).chooseServer(anyObject());
+			RibbonLoadBalancerContext lbContext = new RibbonLoadBalancerContext(lb, config);
+			SpringClientFactory clientFactory = mock(SpringClientFactory.class);
+			IClientConfig config = mock(IClientConfig.class);
+			doReturn(1).when(config).get(eq(CommonClientConfigKey.MaxAutoRetries), anyInt());
+			doReturn(retriesNextServer).when(config).get(eq(CommonClientConfigKey.MaxAutoRetriesNextServer), anyInt());
+			doReturn(true).when(config).get(eq(CommonClientConfigKey.OkToRetryOnAllOperations), eq(false));
+			doReturn(defaultConnectTimeout).when(config).get(eq(CommonClientConfigKey.ConnectTimeout));
+			doReturn(defaultReadTimeout).when(config).get(eq(CommonClientConfigKey.ReadTimeout));
+			doReturn("404").when(config).getPropertyAsString(eq(RibbonLoadBalancedRetryPolicy.RETRYABLE_STATUS_CODES),eq(""));
+			doReturn(config).when(clientFactory).getClientConfig(eq("default"));
+			doReturn(lbContext).when(clientFactory).getLoadBalancerContext(any(String.class));
+			MyBackOffPolicy backOffPolicy = new MyBackOffPolicy();
+			RibbonLoadBalancedRetryFactory loadBalancedRetryFactory = new RibbonLoadBalancedRetryFactory(clientFactory){
+				@Override
+				public BackOffPolicy createBackOffPolicy(String service) {
+					return backOffPolicy;
+				}
+			};
+			HttpRequest springRequest = mock(HttpRequest.class);
+			Request feignRequest = Request.create("GET", "http://foo", new HashMap<String, Collection<String>>(),
+							new byte[]{}, StandardCharsets.UTF_8);
+			Client client = mock(Client.class);
+			FeignLoadBalancer.RibbonRequest request = new FeignLoadBalancer.RibbonRequest(client, feignRequest, new URI("http://foo"));
+			Response response = Response.builder().status(404).headers(new HashMap<String, Collection<String>>()).build();
+			Response fourOFourResponse = Response.builder().status(404).headers(new HashMap<String, Collection<String>>()).build();
+			doReturn(fourOFourResponse).doReturn(response).when(client).execute(any(Request.class), any(Request.Options.class));
+			RetryableFeignLoadBalancer feignLb = new RetryableFeignLoadBalancer(lb, config, inspector, loadBalancedRetryFactory);
+			FeignLoadBalancer.RibbonResponse ribbonResponse = feignLb.execute(request, null);
+			assertEquals(404, ribbonResponse.toResponse().status());
+			assertEquals(new Integer(0), ribbonResponse.toResponse().body().length());
+			verify(client, times(2)).execute(any(Request.class), any(Request.Options.class));
+			assertEquals(1, backOffPolicy.getCount());
 	}
 
 	@Test
@@ -232,7 +287,7 @@ public class RetryableFeignLoadBalancerTests {
 		RibbonLoadBalancerContext lbContext = new RibbonLoadBalancerContext(lb, config);
 		SpringClientFactory clientFactory = mock(SpringClientFactory.class);
 		doReturn(lbContext).when(clientFactory).getLoadBalancerContext(any(String.class));
-		RibbonLoadBalancedRetryPolicyFactory loadBalancedRetryPolicyFactory = new RibbonLoadBalancedRetryPolicyFactory(clientFactory);
+		RibbonLoadBalancedRetryFactory loadBalancedRetryFactory = new RibbonLoadBalancedRetryFactory(clientFactory);
 		HttpRequest springRequest = mock(HttpRequest.class);
 		Request feignRequest = Request.create("GET", "http://foo", new HashMap<String, Collection<String>>(),
 				new byte[]{}, StandardCharsets.UTF_8);
@@ -240,8 +295,7 @@ public class RetryableFeignLoadBalancerTests {
 		FeignLoadBalancer.RibbonRequest request = new FeignLoadBalancer.RibbonRequest(client, feignRequest, new URI("http://foo"));
 		Response response = Response.builder().status(200).headers(new HashMap<String, Collection<String>>()).build();
 		doReturn(response).when(client).execute(any(Request.class), any(Request.Options.class));
-		RetryableFeignLoadBalancer feignLb = new RetryableFeignLoadBalancer(lb, config, inspector, loadBalancedRetryPolicyFactory,
-				loadBalancedBackOffPolicyFactory);
+		RetryableFeignLoadBalancer feignLb = new RetryableFeignLoadBalancer(lb, config, inspector, loadBalancedRetryFactory);
 		RequestSpecificRetryHandler retryHandler = feignLb.getRequestSpecificRetryHandler(request, config);
 		assertEquals(1, retryHandler.getMaxRetriesOnNextServer());
 		assertEquals(1, retryHandler.getMaxRetriesOnSameServer());
@@ -253,7 +307,7 @@ public class RetryableFeignLoadBalancerTests {
 		RibbonLoadBalancerContext lbContext = new RibbonLoadBalancerContext(lb, config);
 		SpringClientFactory clientFactory = mock(SpringClientFactory.class);
 		doReturn(lbContext).when(clientFactory).getLoadBalancerContext(any(String.class));
-		RibbonLoadBalancedRetryPolicyFactory loadBalancedRetryPolicyFactory = new RibbonLoadBalancedRetryPolicyFactory(clientFactory);
+		RibbonLoadBalancedRetryFactory loadBalancedRetryFactory = new RibbonLoadBalancedRetryFactory(clientFactory);
 		HttpRequest springRequest = mock(HttpRequest.class);
 		Request feignRequest = Request.create("GET", "http://foo", new HashMap<String, Collection<String>>(),
 				new byte[]{}, StandardCharsets.UTF_8);
@@ -292,7 +346,7 @@ public class RetryableFeignLoadBalancerTests {
 			public List<Server> getAllServers() {
 				return null;
 			}
-		}, config, inspector, loadBalancedRetryPolicyFactory, loadBalancedBackOffPolicyFactory);
+		}, config, inspector, loadBalancedRetryFactory);
 		ServiceInstance serviceInstance = feignLb.choose("foo");
 		assertEquals("foo", serviceInstance.getHost());
 		assertEquals(80, serviceInstance.getPort());
@@ -312,7 +366,19 @@ public class RetryableFeignLoadBalancerTests {
 		doReturn("").when(config).getPropertyAsString(eq(RibbonLoadBalancedRetryPolicy.RETRYABLE_STATUS_CODES),eq(""));
 		doReturn(config).when(clientFactory).getClientConfig(eq("default"));
 		doReturn(lbContext).when(clientFactory).getLoadBalancerContext(any(String.class));
-		RibbonLoadBalancedRetryPolicyFactory loadBalancedRetryPolicyFactory = new RibbonLoadBalancedRetryPolicyFactory(clientFactory);
+		MyBackOffPolicy backOffPolicy = new MyBackOffPolicy();
+		MyRetryListener myRetryListener = new MyRetryListener();
+		RibbonLoadBalancedRetryFactory loadBalancedRetryFactory = new RibbonLoadBalancedRetryFactory(clientFactory) {
+			@Override
+			public RetryListener[] createRetryListeners(String service) {
+				return new RetryListener[]{myRetryListener};
+			}
+
+			@Override
+			public BackOffPolicy createBackOffPolicy(String service) {
+				return backOffPolicy;
+			}
+		};
 		HttpRequest springRequest = mock(HttpRequest.class);
 		Request feignRequest = Request.create("GET", "http://listener", new HashMap<String, Collection<String>>(),
 			new byte[]{}, StandardCharsets.UTF_8);
@@ -320,15 +386,13 @@ public class RetryableFeignLoadBalancerTests {
 		FeignLoadBalancer.RibbonRequest request = new FeignLoadBalancer.RibbonRequest(client, feignRequest, new URI("http://listener"));
 		Response response = Response.builder().status(200).headers(new HashMap<String, Collection<String>>()).build();
 		doThrow(new IOException("boom")).doReturn(response).when(client).execute(any(Request.class), any(Request.Options.class));
-		MyBackOffPolicyFactory backOffPolicyFactory = new MyBackOffPolicyFactory();
-		MyRetryListeners myRetryListeners = new MyRetryListeners();
-		RetryableFeignLoadBalancer feignLb = new RetryableFeignLoadBalancer(lb, config, inspector, loadBalancedRetryPolicyFactory,
-			backOffPolicyFactory, myRetryListeners);
+
+		RetryableFeignLoadBalancer feignLb = new RetryableFeignLoadBalancer(lb, config, inspector, loadBalancedRetryFactory);
 		FeignLoadBalancer.RibbonResponse ribbonResponse = feignLb.execute(request, null);
 		assertEquals(200, ribbonResponse.toResponse().status());
 		verify(client, times(2)).execute(any(Request.class), any(Request.Options.class));
-		assertEquals(1, backOffPolicyFactory.getCount());
-		assertEquals(1, myRetryListeners.getOnError());
+		assertEquals(1, backOffPolicy.getCount());
+		assertEquals(1, myRetryListener.getOnError());
 	}
 
 	@Test(expected = TerminatedRetryException.class)
@@ -344,17 +408,26 @@ public class RetryableFeignLoadBalancerTests {
 		doReturn("").when(config).getPropertyAsString(eq(RibbonLoadBalancedRetryPolicy.RETRYABLE_STATUS_CODES),eq(""));
 		doReturn(config).when(clientFactory).getClientConfig(eq("default"));
 		doReturn(lbContext).when(clientFactory).getLoadBalancerContext(any(String.class));
-		RibbonLoadBalancedRetryPolicyFactory loadBalancedRetryPolicyFactory = new RibbonLoadBalancedRetryPolicyFactory(clientFactory);
+		Response response = Response.builder().status(200).headers(new HashMap<String, Collection<String>>()).build();
+		MyBackOffPolicy backOffPolicy = new MyBackOffPolicy();
+		MyRetryListenerNotRetry myRetryListenerNotRetry = new MyRetryListenerNotRetry();
+		RibbonLoadBalancedRetryFactory loadBalancedRetryFactory = new RibbonLoadBalancedRetryFactory(clientFactory){
+			@Override
+			public RetryListener[] createRetryListeners(String service) {
+				return new RetryListener[]{myRetryListenerNotRetry};
+			}
+
+			@Override
+			public BackOffPolicy createBackOffPolicy(String service) {
+				return backOffPolicy;
+			}
+		};
 		HttpRequest springRequest = mock(HttpRequest.class);
 		Request feignRequest = Request.create("GET", "http://listener", new HashMap<String, Collection<String>>(),
 			new byte[]{}, StandardCharsets.UTF_8);
 		Client client = mock(Client.class);
 		FeignLoadBalancer.RibbonRequest request = new FeignLoadBalancer.RibbonRequest(client, feignRequest, new URI("http://listener"));
-		Response response = Response.builder().status(200).headers(new HashMap<String, Collection<String>>()).build();
-		MyBackOffPolicyFactory backOffPolicyFactory = new MyBackOffPolicyFactory();
-		MyRetryListenersNotRetry myRetryListenersNotRetry = new MyRetryListenersNotRetry();
-		RetryableFeignLoadBalancer feignLb = new RetryableFeignLoadBalancer(lb, config, inspector, loadBalancedRetryPolicyFactory,
-			backOffPolicyFactory, myRetryListenersNotRetry);
+		RetryableFeignLoadBalancer feignLb = new RetryableFeignLoadBalancer(lb, config, inspector, loadBalancedRetryFactory);
 		FeignLoadBalancer.RibbonResponse ribbonResponse = feignLb.execute(request, null);
 	}
 
@@ -371,7 +444,13 @@ public class RetryableFeignLoadBalancerTests {
 		doReturn("").when(config).getPropertyAsString(eq(RibbonLoadBalancedRetryPolicy.RETRYABLE_STATUS_CODES),eq(""));
 		doReturn(config).when(clientFactory).getClientConfig(eq("default"));
 		doReturn(lbContext).when(clientFactory).getLoadBalancerContext(any(String.class));
-		RibbonLoadBalancedRetryPolicyFactory loadBalancedRetryPolicyFactory = new RibbonLoadBalancedRetryPolicyFactory(clientFactory);
+		MyBackOffPolicy backOffPolicy = new MyBackOffPolicy();
+		RibbonLoadBalancedRetryFactory loadBalancedRetryPolicyFactory = new RibbonLoadBalancedRetryFactory(clientFactory){
+			@Override
+			public BackOffPolicy createBackOffPolicy(String service) {
+				return backOffPolicy;
+			}
+		};
 		HttpRequest springRequest = mock(HttpRequest.class);
 		Request feignRequest = Request.create("GET", "http://listener", new HashMap<String, Collection<String>>(),
 			new byte[]{}, StandardCharsets.UTF_8);
@@ -379,13 +458,11 @@ public class RetryableFeignLoadBalancerTests {
 		FeignLoadBalancer.RibbonRequest request = new FeignLoadBalancer.RibbonRequest(client, feignRequest, new URI("http://listener"));
 		Response response = Response.builder().status(200).headers(new HashMap<String, Collection<String>>()).build();
 		doThrow(new IOException("boom")).doReturn(response).when(client).execute(any(Request.class), any(Request.Options.class));
-		MyBackOffPolicyFactory backOffPolicyFactory = new MyBackOffPolicyFactory();
-		RetryableFeignLoadBalancer feignLb = new RetryableFeignLoadBalancer(lb, config, inspector, loadBalancedRetryPolicyFactory,
-			backOffPolicyFactory);
+		RetryableFeignLoadBalancer feignLb = new RetryableFeignLoadBalancer(lb, config, inspector, loadBalancedRetryPolicyFactory);
 		FeignLoadBalancer.RibbonResponse ribbonResponse = feignLb.execute(request, null);
 		assertEquals(200, ribbonResponse.toResponse().status());
 		verify(client, times(2)).execute(any(Request.class), any(Request.Options.class));
-		assertEquals(1, backOffPolicyFactory.getCount());
+		assertEquals(1, backOffPolicy.getCount());
 	}
 
 	@Test
@@ -402,7 +479,13 @@ public class RetryableFeignLoadBalancerTests {
 		doReturn("404").when(config).getPropertyAsString(eq(RibbonLoadBalancedRetryPolicy.RETRYABLE_STATUS_CODES), eq(""));
 		doReturn(config).when(clientFactory).getClientConfig(eq("default"));
 		doReturn(lbContext).when(clientFactory).getLoadBalancerContext(any(String.class));
-		RibbonLoadBalancedRetryPolicyFactory loadBalancedRetryPolicyFactory = new RibbonLoadBalancedRetryPolicyFactory(clientFactory);
+		MyBackOffPolicy backOffPolicy = new MyBackOffPolicy();
+		RibbonLoadBalancedRetryFactory loadBalancedRetryFactory = new RibbonLoadBalancedRetryFactory(clientFactory){
+			@Override
+			public BackOffPolicy createBackOffPolicy(String service) {
+				return backOffPolicy;
+			}
+		};
 		HttpRequest springRequest = mock(HttpRequest.class);
 		Request feignRequest = Request.create("GET", "http://foo", new HashMap<String, Collection<String>>(),
 				new byte[]{}, StandardCharsets.UTF_8);
@@ -435,18 +518,17 @@ public class RetryableFeignLoadBalancerTests {
 					}
 				}).build();
 		doReturn(fourOFourResponse).when(client).execute(any(Request.class), any(Request.Options.class));
-		MyBackOffPolicyFactory backOffPolicyFactory = new MyBackOffPolicyFactory();
-		RetryableFeignLoadBalancer feignLb = new RetryableFeignLoadBalancer(lb, config, inspector, loadBalancedRetryPolicyFactory, backOffPolicyFactory);
+		RetryableFeignLoadBalancer feignLb = new RetryableFeignLoadBalancer(lb, config, inspector, loadBalancedRetryFactory);
 		FeignLoadBalancer.RibbonResponse ribbonResponse = feignLb.execute(request, null);
 		verify(client, times(2)).execute(any(Request.class), any(Request.Options.class));
-		assertEquals(1, backOffPolicyFactory.getCount());
+		assertEquals(1, backOffPolicy.getCount());
 		InputStream inputStream = ribbonResponse.toResponse().body().asInputStream();
 		byte[] buf = new byte[100];
 		int read = inputStream.read(buf);
 		Assert.assertThat(new String(buf, 0, read), is("test"));
 	}
 
-	class MyBackOffPolicyFactory implements LoadBalancedBackOffPolicyFactory, BackOffPolicy {
+	class MyBackOffPolicy implements BackOffPolicy {
 
 		private int count = 0;
 
@@ -464,34 +546,25 @@ public class RetryableFeignLoadBalancerTests {
 			return count;
 		}
 
-		@Override
-		public BackOffPolicy createBackOffPolicy(String service) {
-			return this;
-		}
 	}
 
-	class MyRetryListeners implements LoadBalancedRetryListenerFactory {
+	class MyRetryListener implements RetryListener {
 
 		private int onError = 0;
 
 		@Override
-		public RetryListener[] createRetryListeners(String service) {
-			return new RetryListener[] {new RetryListener() {
-				@Override
-				public <T, E extends Throwable> boolean open(RetryContext context, RetryCallback<T, E> callback) {
-					return true;
-				}
+		public <T, E extends Throwable> boolean open(RetryContext context, RetryCallback<T, E> callback) {
+			return true;
+		}
 
-				@Override
-				public <T, E extends Throwable> void close(RetryContext context, RetryCallback<T, E> callback, Throwable throwable) {
+		@Override
+		public <T, E extends Throwable> void close(RetryContext context, RetryCallback<T, E> callback, Throwable throwable) {
 
-				}
+		}
 
-				@Override
-				public <T, E extends Throwable> void onError(RetryContext context, RetryCallback<T, E> callback, Throwable throwable) {
-					onError++;
-				}
-			}};
+		@Override
+		public <T, E extends Throwable> void onError(RetryContext context, RetryCallback<T, E> callback, Throwable throwable) {
+			onError++;
 		}
 
 		public int getOnError() {
@@ -499,27 +572,20 @@ public class RetryableFeignLoadBalancerTests {
 		}
 	}
 
-	class MyRetryListenersNotRetry implements LoadBalancedRetryListenerFactory {
+	class MyRetryListenerNotRetry implements RetryListener {
 
 		@Override
-		public RetryListener[] createRetryListeners(String service) {
-			return new RetryListener[] {new RetryListener() {
-				@Override
-				public <T, E extends Throwable> boolean open(RetryContext context, RetryCallback<T, E> callback) {
-					return false;
-				}
-
-				@Override
-				public <T, E extends Throwable> void close(RetryContext context, RetryCallback<T, E> callback, Throwable throwable) {
-
-				}
-
-				@Override
-				public <T, E extends Throwable> void onError(RetryContext context, RetryCallback<T, E> callback, Throwable throwable) {
-
-				}
-			}};
+		public <T, E extends Throwable> boolean open(RetryContext context, RetryCallback<T, E> callback) {
+			return false;
 		}
+
+		@Override
+		public <T, E extends Throwable> void close(RetryContext context, RetryCallback<T, E> callback, Throwable throwable) {
+
+		}
+
+		@Override
+		public <T, E extends Throwable> void onError(RetryContext context, RetryCallback<T, E> callback, Throwable throwable) {}
 	}
 
 }
